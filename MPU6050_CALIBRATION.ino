@@ -5,6 +5,8 @@
 #include <Wire.h>
 #include <MPU6050.h>
 
+#include "WiFiTCP.h"
+
 MPU6050 mpu;
 
 // Calibration offsets
@@ -27,6 +29,14 @@ const float FALL_THRESHOLD_BACKWARD = -45.0; // Backward fall threshold
 // Calibration parameters
 const int CALIBRATION_SAMPLES = 1000;
 const int CALIBRATION_DELAY = 2; // ms between samples
+
+// WiFi and TCP parameters
+const char* WIFI_SSID = "MPU6050_AP";
+const char* WIFI_PASS = "12345678";
+const uint16_t TCP_PORT = 3333;
+WiFiTCP wifiTCP;
+
+#define THEFT_RELAY_PIN 26
 
 void setup() {
   Serial.begin(115200);
@@ -63,25 +73,140 @@ void setup() {
   Serial.println("=======================================================");
   
   delay(1000);
+
+  // Start WiFi AP and TCP server
+  Serial.println("Starting WiFi Access Point and TCP server...");
+  wifiTCP.begin(WIFI_SSID, WIFI_PASS, TCP_PORT);
+  Serial.print("WiFi AP SSID: "); Serial.println(WIFI_SSID);
+  Serial.print("WiFi AP Password: "); Serial.println(WIFI_PASS);
+  Serial.print("TCP Port: "); Serial.println(TCP_PORT);
+  Serial.println("Connect your phone to this WiFi and use a TCP client app to connect.");
+  
+  pinMode(THEFT_RELAY_PIN, OUTPUT);
 }
 
 void loop() {
+  static int fallCheckCount = 0; // Count how many times we check for fall after impact
+  static bool impactOccurred = false; // Track if impact happened
+  const int MAX_FALL_CHECKS = 5; // Check for fall only 5 times after impact
+  
   // Read sensor data
   readMPU6050();
   
   // Calculate angles
   calculateAngles();
   
-  // Check for fall conditions
-  checkFallCondition();
+  // Check for impact first
+  bool impactDetected = detectImpact();
+  if (impactDetected && !impactOccurred) {
+    impactOccurred = true;
+    fallCheckCount = 0; // Reset fall check counter
+    Serial.println("*** STRONG IMPACT DETECTED! ***");
+    Serial.println("Checking for fall (5 attempts)...");
+  }
   
+  // Check for fall conditions
+  String status = "UPRIGHT";
+  String fallType = "";
+  // Determine fall type
+  if (roll <= FALL_THRESHOLD_LEFT) {
+    fallType = "LEFT FALL";
+  } else if (roll >= FALL_THRESHOLD_RIGHT) {
+    fallType = "RIGHT FALL";
+  }
+  if (pitch >= FALL_THRESHOLD_FORWARD) {
+    if (fallType != "") fallType += " + ";
+    fallType += "FORWARD FALL";
+  } else if (pitch <= FALL_THRESHOLD_BACKWARD) {
+    if (fallType != "") fallType += " + ";
+    fallType += "BACKWARD FALL";
+  }
+
+  // Set status for TCP data
+  if (fallType != "") {
+    status = fallType;
+  } else if (abs(roll) < 10 && abs(pitch) < 10) {
+    status = "UPRIGHT";
+  } else if (roll < -10) {
+    status = "LEANING_LEFT";
+  } else if (roll > 10) {
+    status = "LEANING_RIGHT";
+  }
+  if (pitch > 10 && fallType == "") {
+    status += ",NOSE_DOWN";
+  } else if (pitch < -10 && fallType == "") {
+    status += ",NOSE_UP";
+  }
+
   // Print angle data
   printAngleData();
+
+  // Send data to TCP client (phone app)
+  String tcpData = String(roll, 2) + "," + String(pitch, 2) + "," + status;
+  wifiTCP.handleClient(tcpData);
   
-  delay(100); // Update rate: 10Hz
+  // Check for TCP commands
+  handleTCPCommands();
+
+  // Check for fall conditions and send fall message if needed
+  if (fallType != "") {
+    Serial.println("*** FALL DETECTED! ***");
+    Serial.print("Fall Type: ");
+    Serial.println(fallType);
+    Serial.println("**********************");
+    String fallMsg = "FALL_DETECTED," + fallType;
+    wifiTCP.handleClient(fallMsg);
+    
+    // If impact occurred and we're still within check limit, trigger accident
+    if (impactOccurred && fallCheckCount < MAX_FALL_CHECKS) {
+      Serial.println("!!! REAL ACCIDENT DETECTED !!!");
+      wifiTCP.handleClient("ACCIDENT_ALERT," + fallType);
+      emergencyPattern(); // Activate emergency siren/relay
+      impactOccurred = false; // Reset impact flag
+      fallCheckCount = 0; // Reset counter
+    }
+  }
+  
+  // If impact occurred, increment fall check counter
+  if (impactOccurred) {
+    fallCheckCount++;
+    Serial.print("Fall check: ");
+    Serial.print(fallCheckCount);
+    Serial.print("/");
+    Serial.println(MAX_FALL_CHECKS);
+    
+    // Reset if we've checked enough times without finding persistent fall
+    if (fallCheckCount >= MAX_FALL_CHECKS) {
+      impactOccurred = false;
+      fallCheckCount = 0;
+      Serial.println("Impact timeout - no accident detected");
+    }
+  }
+
+  delay(50); // Update rate: 10Hz
+}
+bool detectImpact() {
+  // Calculate acceleration magnitude in g
+  float ax_g = ax / 16384.0;
+  float ay_g = ay / 16384.0;
+  float az_g = az / 16384.0;
+  float accMag = sqrt(ax_g * ax_g + ay_g * ay_g + az_g * az_g);
+  // Threshold for impact (e.g., >2g)
+  return accMag > 2.0;
 }
 
 void calibrateMPU6050() {
+  Serial.println("\n=== PRE-CALIBRATION POSITION CHECK ===");
+  
+  // Check current position before calibration
+  if (!checkUprightPosition()) {
+    Serial.println("⚠️ CALIBRATION WARNING!");
+    Serial.println("Motorcycle is not in upright position, but continuing calibration...");
+    Serial.println("Note: Calibration may not be optimal. Position bike upright for best results.");
+  } else {
+    Serial.println("✅ Motorcycle position verified as UPRIGHT");
+  }
+  
   Serial.println("\n=== CALIBRATION PROCESS ===");
   Serial.println("IMPORTANT: Keep the motorcycle/sensor COMPLETELY LEVEL and STATIONARY!");
   Serial.println("Calibration will start in 5 seconds...");
@@ -228,6 +353,72 @@ void printAngleData() {
 }
 
 // Additional utility functions
+bool checkUprightPosition() {
+  Serial.println("Checking motorcycle position...");
+  
+  const int POSITION_CHECK_SAMPLES = 100;
+  const float UPRIGHT_TOLERANCE = 15.0; // degrees tolerance for "upright"
+  
+  long ax_sum = 0, ay_sum = 0, az_sum = 0;
+  
+  // Take samples to determine current position
+  for (int i = 0; i < POSITION_CHECK_SAMPLES; i++) {
+    int16_t temp_ax, temp_ay, temp_az, temp_gx, temp_gy, temp_gz;
+    mpu.getMotion6(&temp_ax, &temp_ay, &temp_az, &temp_gx, &temp_gy, &temp_gz);
+    
+    ax_sum += temp_ax;
+    ay_sum += temp_ay;
+    az_sum += temp_az;
+    
+    delay(10);
+  }
+  
+  // Calculate average accelerometer values
+  float avg_ax = (ax_sum / POSITION_CHECK_SAMPLES) / 16384.0;
+  float avg_ay = (ay_sum / POSITION_CHECK_SAMPLES) / 16384.0;
+  float avg_az = (az_sum / POSITION_CHECK_SAMPLES) / 16384.0;
+  
+  // Calculate current angles
+  float current_roll = atan2(avg_ay, avg_az) * 180 / PI;
+  float current_pitch = atan2(-avg_ax, sqrt(avg_ay * avg_ay + avg_az * avg_az)) * 180 / PI;
+  
+  // Display current position
+  Serial.print("Current Position - Roll: ");
+  Serial.print(current_roll, 1);
+  Serial.print("°, Pitch: ");
+  Serial.print(current_pitch, 1);
+  Serial.println("°");
+  
+  // Check if motorcycle is reasonably upright
+  if (abs(current_roll) <= UPRIGHT_TOLERANCE && abs(current_pitch) <= UPRIGHT_TOLERANCE) {
+    Serial.print("Position Status: UPRIGHT (within ±");
+    Serial.print(UPRIGHT_TOLERANCE, 0);
+    Serial.println("° tolerance)");
+    return true;
+  } else {
+    Serial.println("Position Status: NOT UPRIGHT");
+    
+    // Provide specific guidance
+    if (abs(current_roll) > UPRIGHT_TOLERANCE) {
+      if (current_roll > 0) {
+        Serial.println("🏍️  Motorcycle is leaning RIGHT - Please straighten it");
+      } else {
+        Serial.println("🏍️  Motorcycle is leaning LEFT - Please straighten it");
+      }
+    }
+    
+    if (abs(current_pitch) > UPRIGHT_TOLERANCE) {
+      if (current_pitch > 0) {
+        Serial.println("🏍️  Motorcycle nose is DOWN - Please level it");
+      } else {
+        Serial.println("🏍️  Motorcycle nose is UP - Please level it");
+      }
+    }
+    
+    return false;
+  }
+}
+
 void printSensorRawData() {
   Serial.print("Raw Accel: X=");
   Serial.print(ax); Serial.print(" Y=");
@@ -243,4 +434,125 @@ void setFallThresholds(float left, float right, float forward, float backward) {
   // This function can be called to adjust fall detection thresholds
   // Values should be passed as positive degrees
   // left and backward thresholds will be automatically made negative
+}
+
+void performManualCalibration() {
+  // Alternative calibration function that can be called manually
+  // Useful if you want to recalibrate without restarting
+  Serial.println("\n=== MANUAL RECALIBRATION ===");
+  if (checkUprightPosition()) {
+    calibrateMPU6050();
+    Serial.println("Manual calibration completed!");
+  } else {
+    Serial.println("Cannot calibrate - motorcycle not in upright position");
+  }
+}
+
+void printCalibrationStatus() {
+  Serial.println("\n=== CURRENT CALIBRATION OFFSETS ===");
+  Serial.print("Accelerometer - X: "); Serial.print(ax_offset);
+  Serial.print(", Y: "); Serial.print(ay_offset);
+  Serial.print(", Z: "); Serial.println(az_offset);
+  Serial.print("Gyroscope - X: "); Serial.print(gx_offset);
+  Serial.print(", Y: "); Serial.print(gy_offset);
+  Serial.print(", Z: "); Serial.println(gz_offset);
+  Serial.println("=====================================");
+}
+
+
+void emergencyPattern() {
+  Serial.println("Starting emergency pattern...");
+  
+  // Phase 1: Rapid emergency sirens (3 cycles) - Shorter delays
+  for (int cycle = 0; cycle < 3; cycle++) {
+    // Fast ascending siren
+    for (int i = 0; i < 8; i++) {
+      digitalWrite(THEFT_RELAY_PIN, HIGH);
+      Serial.print("🚑");
+      delay(30 + (i * 10)); // Reduced delay 30-100ms
+      digitalWrite(THEFT_RELAY_PIN, LOW);
+      delay(20); // Reduced delay
+      yield(); // Allow ESP32 to handle WiFi tasks
+    }
+    
+    // Fast descending siren
+    for (int i = 7; i >= 0; i--) {
+      digitalWrite(THEFT_RELAY_PIN, HIGH);
+      Serial.print("🚨");
+      delay(30 + (i * 10)); // Reduced delay 100-30ms
+      digitalWrite(THEFT_RELAY_PIN, LOW);
+      delay(20); // Reduced delay
+      yield(); // Allow ESP32 to handle WiFi tasks
+    }
+    yield(); // Allow ESP32 to handle WiFi tasks
+  }
+  
+  delay(200); // Reduced pause
+  
+  // Phase 2: Urgent triple bursts (3 sets) - Reduced from 5 sets
+  for (int set = 0; set < 3; set++) {
+    // Triple burst
+    for (int burst = 0; burst < 3; burst++) {
+      digitalWrite(THEFT_RELAY_PIN, HIGH);
+      Serial.print("⚡");
+      delay(80); // Reduced delay
+      digitalWrite(THEFT_RELAY_PIN, LOW);
+      delay(80); // Reduced delay
+      yield(); // Allow ESP32 to handle WiFi tasks
+    }
+    delay(200); // Reduced pause between sets
+    yield(); // Allow ESP32 to handle WiFi tasks
+  }
+  
+  delay(200); // Reduced pause
+  
+  // Phase 3: Final urgent pulses (2 pulses) - Reduced from 4
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(THEFT_RELAY_PIN, HIGH);
+    Serial.print("🆘");
+    delay(400); // Reduced long pulse
+    digitalWrite(THEFT_RELAY_PIN, LOW);
+    delay(100); // Reduced pause
+    yield(); // Allow ESP32 to handle WiFi tasks
+  }
+  
+  Serial.println(" EMERGENCY PATTERN COMPLETE");
+}
+
+void handleTCPCommands() {
+  // Check if there's an incoming command from TCP client
+  String command = wifiTCP.getCommand();
+  if (command.length() > 0) {
+    command.trim();
+    command.toLowerCase();
+    
+    Serial.print("Received TCP command: ");
+    Serial.println(command);
+    
+    if (command == "recalibrate") {
+      Serial.println("TCP Command: Recalibrating device...");
+      wifiTCP.handleClient("STATUS,Recalibrating device...");
+      calibrateMPU6050();
+      wifiTCP.handleClient("STATUS,Recalibration complete!");
+      Serial.println("TCP Command: Recalibration complete!");
+    }
+    else if (command == "restart") {
+      Serial.println("TCP Command: Restarting device...");
+      wifiTCP.handleClient("STATUS,Restarting device...");
+      delay(1000);
+      ESP.restart();
+    }
+    else if (command == "alarm") {
+      Serial.println("TCP Command: Manual alarm triggered!");
+      wifiTCP.handleClient("STATUS,Manual alarm activated!");
+      emergencyPattern(); // Activate emergency siren/relay
+      wifiTCP.handleClient("STATUS,Manual alarm complete!");
+      Serial.println("TCP Command: Manual alarm complete!");
+    }
+    else {
+      Serial.print("TCP Command: Unknown command - ");
+      Serial.println(command);
+      wifiTCP.handleClient("ERROR,Unknown command: " + command);
+    }
+  }
 }
