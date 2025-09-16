@@ -122,7 +122,7 @@ void loop() {
   // Calculate angles and update motion detection
   calculateAngles();
   
-  // Update motion detection with current accelerometer values
+  // Update motion detection with accelerometer data
   float ax_g = ax / 16384.0;
   float ay_g = ay / 16384.0;
   float az_g = az / 16384.0;
@@ -185,8 +185,9 @@ void loop() {
                    String(pitch, 2) + "," + 
                    status + "," +
                    String(motionDetector.getLinearAccelMagnitude(), 2) + "," +  // Linear acceleration in g
-                   String(motionDetector.getAverageSpeed(), 2) + "," +          // Average speed estimate
-                   (motionDetector.isMoving() ? "MOVING" : "STATIONARY");       // Movement state
+                   String(motionDetector.getAverageSpeed(), 2) + "," +          // Keep for compatibility
+                   (motionDetector.isMoving() ? "MOVING" : "STATIONARY");
+
   wifiTCP.handleClient(tcpData);
   
   // Check for TCP commands
@@ -289,7 +290,7 @@ bool detectImpact() {
   float ax_g = ax / 16384.0;
   float ay_g = ay / 16384.0;
   float az_g = az / 16384.0;
-  float accMag = sqrt(ax_g * ax_g + ay_g * az_g);
+  float accMag = sqrt(ax_g * ax_g + ay_g * ay_g);
   // Use the variable threshold
   // return accMag > 3.0;
   return accMag > 2.0;
