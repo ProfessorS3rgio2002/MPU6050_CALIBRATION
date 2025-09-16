@@ -6,8 +6,15 @@
 #include <MPU6050.h>
 
 #include "WiFiTCP.h"
-
+#include "EmergencyCancel.h"
+#include "IgnitionHandler.h"
+#include "Config.h"
+#include "MotionDetection.h"
 MPU6050 mpu;
+bool detectImpact();
+
+// Motion detection
+MotionDetection motionDetector(0.3);  // 0.3g threshold for movement detection
 
 // Calibration offsets
 int16_t ax_offset, ay_offset, az_offset;
@@ -25,18 +32,25 @@ const float FALL_THRESHOLD_LEFT = -45.0;   // Left fall threshold
 const float FALL_THRESHOLD_RIGHT = 45.0;   // Right fall threshold
 const float FALL_THRESHOLD_FORWARD = 45.0; // Forward fall threshold
 const float FALL_THRESHOLD_BACKWARD = -45.0; // Backward fall threshold
-
+// float impactThreshold = 3.0; // Default impact threshold in g
 // Calibration parameters
 const int CALIBRATION_SAMPLES = 1000;
 const int CALIBRATION_DELAY = 2; // ms between samples
 
 // WiFi and TCP parameters
+bool ignitionOn = false; 
 const char* WIFI_SSID = "MPU6050_AP";
 const char* WIFI_PASS = "12345678";
 const uint16_t TCP_PORT = 3333;
 WiFiTCP wifiTCP;
 
 #define THEFT_RELAY_PIN 26
+
+// Add these variables at the top with other globals
+const int REQUIRED_CONSECUTIVE_FALLS = 40; // 40 checks × 50ms = 2 seconds
+static int consecutiveFallCount = 0;
+
+EmergencyCancel emergencyCancel;
 
 void setup() {
   Serial.begin(115200);
@@ -83,27 +97,52 @@ void setup() {
   Serial.println("Connect your phone to this WiFi and use a TCP client app to connect.");
   
   pinMode(THEFT_RELAY_PIN, OUTPUT);
+  emergencyCancel.begin();
 }
 
 void loop() {
+  // Update and check ignition state first
+  updateIgnitionState();
+  if (hasIgnitionStateChanged()) {
+    float voltage = getIgnitionVoltage();
+    if (ignitionOn) {
+      Serial.printf("🔑 Ignition turned ON (%.2fV)\n", voltage);
+    } else {
+      Serial.printf("🔓 Ignition turned OFF (%.2fV)\n", voltage);
+    }
+  }
+
   static int fallCheckCount = 0; // Count how many times we check for fall after impact
   static bool impactOccurred = false; // Track if impact happened
-  const int MAX_FALL_CHECKS = 5; // Check for fall only 5 times after impact
-  
+  const int MAX_FALL_CHECKS = 60; // Check for fall only 60 times after impact
+
   // Read sensor data
   readMPU6050();
   
-  // Calculate angles
+  // Calculate angles and update motion detection
   calculateAngles();
+  
+  // Update motion detection with current accelerometer values
+  float ax_g = ax / 16384.0;
+  float ay_g = ay / 16384.0;
+  float az_g = az / 16384.0;
+  motionDetector.update(ax_g, ay_g, az_g);
   
   // Check for impact first
   bool impactDetected = detectImpact();
   if (impactDetected && !impactOccurred) {
+    // Only consider it a potential accident if we were moving
+    if (motionDetector.isMoving()) {
+      Serial.println("Vehicle was in motion before impact!");
+      Serial.printf("Linear acceleration: %.2fg\n", motionDetector.getLinearAccelMagnitude());
+      Serial.printf("Average speed estimate: %.2f\n", motionDetector.getAverageSpeed());
     impactOccurred = true;
-    fallCheckCount = 0; // Reset fall check counter
+    fallCheckCount = 0;
+    consecutiveFallCount = 0; // Reset consecutive fall counter
     Serial.println("*** STRONG IMPACT DETECTED! ***");
-    Serial.println("Checking for fall (5 attempts)...");
+    Serial.println("Checking for persistent fall...");
   }
+}
   
   // Check for fall conditions
   String status = "UPRIGHT";
@@ -142,7 +181,12 @@ void loop() {
   printAngleData();
 
   // Send data to TCP client (phone app)
-  String tcpData = String(roll, 2) + "," + String(pitch, 2) + "," + status;
+  String tcpData = String(roll, 2) + "," + 
+                   String(pitch, 2) + "," + 
+                   status + "," +
+                   String(motionDetector.getLinearAccelMagnitude(), 2) + "," +  // Linear acceleration in g
+                   String(motionDetector.getAverageSpeed(), 2) + "," +          // Average speed estimate
+                   (motionDetector.isMoving() ? "MOVING" : "STATIONARY");       // Movement state
   wifiTCP.handleClient(tcpData);
   
   // Check for TCP commands
@@ -157,43 +201,101 @@ void loop() {
     String fallMsg = "FALL_DETECTED," + fallType;
     wifiTCP.handleClient(fallMsg);
     
-    // If impact occurred and we're still within check limit, trigger accident
-    if (impactOccurred && fallCheckCount < MAX_FALL_CHECKS) {
-      Serial.println("!!! REAL ACCIDENT DETECTED !!!");
-      wifiTCP.handleClient("ACCIDENT_ALERT," + fallType);
-      emergencyPattern(); // Activate emergency siren/relay
-      impactOccurred = false; // Reset impact flag
-      fallCheckCount = 0; // Reset counter
+    // Modified fall detection logic
+    if (fallType != "") {
+      consecutiveFallCount++; // Increment consecutive fall counter
+      Serial.print("Consecutive fall count: ");
+      Serial.print(consecutiveFallCount);
+      Serial.print("/");
+      Serial.println(REQUIRED_CONSECUTIVE_FALLS);
+      
+      // Only trigger accident if fall persists for required duration and was moving
+      if (impactOccurred && consecutiveFallCount >= REQUIRED_CONSECUTIVE_FALLS) {
+        if (motionDetector.isMoving()) {
+          Serial.println("!!! REAL ACCIDENT DETECTED !!!");
+          Serial.println("Vehicle was in motion before the fall!");
+        Serial.println("Motorcycle has been fallen for 2 seconds after impact!");
+        wifiTCP.handleClient("ACCIDENT_ALERT," + fallType);
+        emergencyPattern();
+          emergencyCancel.setEmergencyActive(true);  // Start monitoring for cancel pattern
+          Serial.println("Turn ignition ON/OFF 3 times to cancel emergency");
+          // Don't reset flags until cancelled
+        } else {
+          Serial.println("False alarm - Vehicle was stationary before fall");
+          impactOccurred = false;
+          consecutiveFallCount = 0;
+        }
+      }
+    } else {
+      consecutiveFallCount = 0; // Reset if not fallen
     }
   }
   
   // If impact occurred, increment fall check counter
   if (impactOccurred) {
     fallCheckCount++;
-    Serial.print("Fall check: ");
-    Serial.print(fallCheckCount);
-    Serial.print("/");
-    Serial.println(MAX_FALL_CHECKS);
     
     // Reset if we've checked enough times without finding persistent fall
     if (fallCheckCount >= MAX_FALL_CHECKS) {
       impactOccurred = false;
       fallCheckCount = 0;
-      Serial.println("Impact timeout - no accident detected");
+      consecutiveFallCount = 0;
+      Serial.println("Impact timeout - no persistent fall detected");
     }
   }
 
+  // Update emergency cancel system
+  emergencyCancel.update();
+  
+  // Check if emergency was cancelled
+  if (emergencyCancel.checkCancelPattern()) {
+      Serial.println("Emergency call cancelled by user!");
+      wifiTCP.handleClient("STATUS,Emergency cancelled by user");
+      impactOccurred = false;
+      consecutiveFallCount = 0;
+      fallCheckCount = 0;
+      emergencyCancel.reset();
+  }
+  
+  // Check for serial commands
+  if (Serial.available()) {
+    String serialCmd = Serial.readStringUntil('\n');
+    serialCmd.trim();
+    
+        if (serialCmd == "simulate") {
+        Serial.println("\n=== SIMULATING ACCIDENT ===");
+        Serial.println("[SIM] Setting emergency active state...");
+        
+        // Simulate the same sequence as a real accident
+        Serial.println("[SIM] !!! REAL ACCIDENT DETECTED !!!");
+        Serial.println("[SIM] Simulated accident - RIGHT FALL");
+        wifiTCP.handleClient("ACCIDENT_ALERT,RIGHT FALL");
+        emergencyPattern();
+        emergencyCancel.setEmergencyActive(true);  // Start monitoring for cancel pattern
+        
+        Serial.println("[SIM] Emergency active: " + String(emergencyCancel.isEmergencyActive() ? "YES" : "NO"));
+        Serial.println("[SIM] Current ignition state: " + String(ignitionOn ? "ON" : "OFF"));
+        Serial.println("[SIM] Turn ignition ON/OFF 3 times to cancel emergency");
+        Serial.println("[SIM] You have 3 seconds to complete the pattern");
+    }
+  }
+  
   delay(50); // Update rate: 10Hz
 }
+
+
 bool detectImpact() {
   // Calculate acceleration magnitude in g
   float ax_g = ax / 16384.0;
   float ay_g = ay / 16384.0;
   float az_g = az / 16384.0;
-  float accMag = sqrt(ax_g * ax_g + ay_g * ay_g + az_g * az_g);
-  // Threshold for impact (e.g., >2g)
+  float accMag = sqrt(ax_g * ax_g + ay_g * az_g);
+  // Use the variable threshold
+  // return accMag > 3.0;
   return accMag > 2.0;
 }
+
+
 
 void calibrateMPU6050() {
   Serial.println("\n=== PRE-CALIBRATION POSITION CHECK ===");
@@ -548,6 +650,20 @@ void handleTCPCommands() {
       emergencyPattern(); // Activate emergency siren/relay
       wifiTCP.handleClient("STATUS,Manual alarm complete!");
       Serial.println("TCP Command: Manual alarm complete!");
+    }
+    else if (command.startsWith("setthreshold,")) {
+      // Extract the threshold value
+      // String thresholdStr = command.substring(13); // Remove "setthreshold,"
+      // float newThreshold = thresholdStr.toFloat();
+      // if (newThreshold > 0 && newThreshold <= 10.0) { // Reasonable range
+      //   impactThreshold = newThreshold;
+      //   Serial.print("TCP Command: Impact threshold set to ");
+      //   Serial.println(impactThreshold);
+      //   wifiTCP.handleClient("STATUS,Impact threshold set to " + String(impactThreshold, 1) + "g");
+      // } else {
+      //   Serial.println("TCP Command: Invalid threshold value");
+      //   wifiTCP.handleClient("ERROR,Invalid threshold value: " + thresholdStr);
+      // }
     }
     else {
       Serial.print("TCP Command: Unknown command - ");
