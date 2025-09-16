@@ -26,48 +26,61 @@ void MotionDetection::updateMovingState() {
     int maxConsecutive = 0;
     float maxAccel = 0;
     bool hasSuddenSpike = false;
+    bool hasSustainedFastMotion = false;
+    int fastMotionCount = 0;
     
     for (int i = 0; i < HISTORY_SIZE; i++) {
         variance += (accelHistory[i] - mean) * (accelHistory[i] - mean);
         
-        // Track maximum acceleration to detect sudden spikes
+        // Track maximum acceleration
         if (accelHistory[i] > maxAccel) {
             maxAccel = accelHistory[i];
         }
         
-        // Check for consistent motion within normal riding range (0.15 - 0.40 m/s)
+        // Check for three types of motion:
+        // 1. Normal riding range (0.13 - 0.40)
+        // 2. Fast riding range (0.40 - 0.80)
+        // 3. Sudden spikes (> 0.80)
         if (accelHistory[i] >= 0.13 && accelHistory[i] <= 0.40) {
             consecutiveCount++;
             maxConsecutive = max(maxConsecutive, consecutiveCount);
-        } else {
-            consecutiveCount = 0;
+        } else if (accelHistory[i] > 0.40 && accelHistory[i] <= 0.80) {
+            fastMotionCount++;
+            if (fastMotionCount >= HISTORY_SIZE * 0.2) { // 20% of samples show fast motion
+                hasSustainedFastMotion = true;
+            }
+        } else if (accelHistory[i] > 0.80) {
+            // Only count as spike if it's a sudden peak
+            bool isSuddenPeak = (i > 0 && i < HISTORY_SIZE-1) && 
+                               (accelHistory[i] > accelHistory[i-1] * 2.0) && 
+                               (accelHistory[i] > accelHistory[i+1] * 2.0);
+            if (isSuddenPeak) {
+                hasSuddenSpike = true;
+            }
         }
         
-        // Detect sudden acceleration spikes typical of falls
-        if (accelHistory[i] > 0.8) { // Threshold for sudden movements
-            hasSuddenSpike = true;
+        if (accelHistory[i] < 0.13) {
+            consecutiveCount = 0;
         }
     }
     variance /= HISTORY_SIZE;
     
-    // New conditions for movement detection:
-    // 1. Must have sustained motion in normal riding range
-    // 2. Variance should be moderate (not too stable, not too chaotic)
-    // 3. No sudden acceleration spikes
-    const float MIN_VARIANCE = 0.001;    // Minimum variance for real movement
-    const float MAX_VARIANCE = 0.05;     // Maximum variance for normal riding
-    const float MIN_CONSECUTIVE = HISTORY_SIZE * 0.3; // Need 30% consistent samples
+    // Adjusted movement detection conditions
+    const float MIN_VARIANCE = 0.001;
+    const float MAX_VARIANCE = 0.05;
+    const float MIN_CONSECUTIVE = HISTORY_SIZE * 0.3;
     
     bool hasNormalMotion = maxConsecutive >= MIN_CONSECUTIVE;
     bool hasReasonableVariance = variance >= MIN_VARIANCE && variance <= MAX_VARIANCE;
     
-    // Only consider it moving if we have normal motion patterns without sudden spikes
-    moving = hasNormalMotion && hasReasonableVariance && !hasSuddenSpike;
+    // Consider moving if either normal motion or sustained fast motion is detected
+    moving = (hasNormalMotion || hasSustainedFastMotion) && 
+             !hasSuddenSpike;
 
     // Enhanced debug output
-    Serial.printf("Motion Debug - Accel: %.3fg, Mean: %.3f, Var: %.3f, MaxAccel: %.3f, Consec: %d/%d, Spike: %s, Moving: %s\n", 
+    Serial.printf("Motion Debug - Accel: %.3fg, Mean: %.3f, Var: %.3f, MaxAccel: %.3f, Normal: %d/%d, Fast: %d, Spike: %s, Moving: %s\n", 
                  linearAccelMag, mean, variance, maxAccel, maxConsecutive, (int)MIN_CONSECUTIVE, 
-                 hasSuddenSpike ? "YES" : "NO", moving ? "YES" : "NO");
+                 fastMotionCount, hasSuddenSpike ? "YES" : "NO", moving ? "YES" : "NO");
 }
 
 void MotionDetection::update(float ax, float ay, float az) {

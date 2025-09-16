@@ -130,19 +130,24 @@ void loop() {
   
   // Check for impact first
   bool impactDetected = detectImpact();
+  static bool wasMovingBeforeImpact = false;  // Add this to track movement state
+
   if (impactDetected && !impactOccurred) {
-    // Only consider it a potential accident if we were moving
-    if (motionDetector.isMoving()) {
+    // Store the movement state at the moment of impact
+    wasMovingBeforeImpact = motionDetector.isMoving();
+    
+    if (wasMovingBeforeImpact) {
       Serial.println("Vehicle was in motion before impact!");
       Serial.printf("Linear acceleration: %.2fg\n", motionDetector.getLinearAccelMagnitude());
-      Serial.printf("Average speed estimate: %.2f\n", motionDetector.getAverageSpeed());
-    impactOccurred = true;
-    fallCheckCount = 0;
-    consecutiveFallCount = 0; // Reset consecutive fall counter
-    Serial.println("*** STRONG IMPACT DETECTED! ***");
-    Serial.println("Checking for persistent fall...");
+      impactOccurred = true;
+      fallCheckCount = 0;
+      consecutiveFallCount = 0;
+      Serial.println("*** STRONG IMPACT DETECTED! ***");
+      Serial.println("Checking for persistent fall...");
+    } else {
+      Serial.println("Impact detected but vehicle was stationary - ignoring");
+    }
   }
-}
   
   // Check for fall conditions
   String status = "UPRIGHT";
@@ -212,15 +217,14 @@ void loop() {
       
       // Only trigger accident if fall persists for required duration and was moving
       if (impactOccurred && consecutiveFallCount >= REQUIRED_CONSECUTIVE_FALLS) {
-        if (motionDetector.isMoving()) {
+        if (wasMovingBeforeImpact) {  // Only trigger if was moving before impact
           Serial.println("!!! REAL ACCIDENT DETECTED !!!");
-          Serial.println("Vehicle was in motion before the fall!");
-        Serial.println("Motorcycle has been fallen for 2 seconds after impact!");
-        wifiTCP.handleClient("ACCIDENT_ALERT," + fallType);
-        emergencyPattern();
-          emergencyCancel.setEmergencyActive(true);  // Start monitoring for cancel pattern
+          Serial.println("Motorcycle has been fallen for 2 seconds after impact!");
+          Serial.println("Vehicle was in motion before the accident!");
+          wifiTCP.handleClient("ACCIDENT_ALERT," + fallType);
+          emergencyPattern();
+          emergencyCancel.setEmergencyActive(true);
           Serial.println("Turn ignition ON/OFF 3 times to cancel emergency");
-          // Don't reset flags until cancelled
         } else {
           Serial.println("False alarm - Vehicle was stationary before fall");
           impactOccurred = false;
